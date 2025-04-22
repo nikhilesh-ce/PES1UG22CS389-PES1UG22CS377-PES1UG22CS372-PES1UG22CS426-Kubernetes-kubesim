@@ -211,45 +211,47 @@ program.command('pod-info <podId>')
   });
 
 
-program
+  program
   .command('check-health')
   .description('Check the overall health status of the cluster')
   .action(async () => {
     try {
-      // Get nodes and pods data
+      // Get health status directly from the health endpoint
+      const healthResponse = await axios.get(`${API_SERVER_URL}/health`);
+      const healthData = healthResponse.data;
+
+      // Get detailed nodes and pods data
       const nodesResponse = await axios.get(`${API_SERVER_URL}/nodes`);
       const podsResponse = await axios.get(`${API_SERVER_URL}/pods`);
 
-      // Process nodes data (handling both array and object with nodes array)
+      // Process nodes data
       const nodes = nodesResponse.data.nodes || nodesResponse.data;
       const healthyNodes = nodes.filter(node => node.status === 'healthy').length;
       const totalNodes = nodes.length;
 
-      // Calculate CPU resources
-      const totalCores = nodes.reduce((sum, node) => sum + (node.cpuCores || 0), 0);
-      const usedCores = nodes.reduce((sum, node) => sum + ((node.cpuCores || 0) - (node.availableCores || 0)), 0);
-      const availableCores = totalCores - usedCores;
-      const utilization = `${Math.round((usedCores / totalCores) * 100)}%`;
+      // Process pods data - handle both array and object formats
+      let pods = [];
+      if (Array.isArray(podsResponse.data)) {
+        pods = podsResponse.data.map(entry => 
+          Array.isArray(entry) ? { id: entry[0], ...entry[1] } : entry
+        );
+      } else if (podsResponse.data?.pods) {
+        pods = podsResponse.data.pods;
+      }
 
-      // Process pods data (handling nested array format)
-      const podEntries = Array.isArray(podsResponse.data) ? podsResponse.data : [];
-      const runningPods = podEntries.filter(entry => entry[1]?.status === 'running').length;
-      const pendingPods = podEntries.filter(entry => !entry[1]?.status || entry[1]?.status === 'pending').length;
-
-      // Determine overall status (2/3 nodes healthy = degraded, all healthy = healthy, else unhealthy)
-      const status = healthyNodes === totalNodes ? 'healthy' :
-                    healthyNodes >= Math.floor(totalNodes / 2) ? 'degraded' : 'unhealthy';
+      const runningPods = pods.filter(pod => pod.status === 'running').length;
+      const pendingPods = pods.filter(pod => pod.status === 'pending').length;
 
       // Format the output
-      console.log(`Cluster Status: ${status.toUpperCase()}`);
+      console.log(`Cluster Status: ${healthData.status.toUpperCase()}`);
       console.log(`Nodes: ${healthyNodes}/${totalNodes} operational`);
-      console.log(`Resources: ${availableCores}/${totalCores} cores (${utilization}) available`);
+      console.log(`Resources: ${healthData.resources.cpu.available}/${healthData.resources.cpu.total} cores (${healthData.resources.cpu.utilization}) available`);
       console.log(`Pods: ${runningPods} running, ${pendingPods} pending`);
       console.log(`Last Check: ${new Date().toISOString()}`);
 
       // Set appropriate exit code
-      process.exitCode = status === 'healthy' ? 0 : 
-                         status === 'degraded' ? 1 : 2;
+      process.exitCode = healthData.status === 'healthy' ? 0 : 
+                         healthData.status === 'degraded' ? 1 : 2;
     } catch (err) {
       console.error('Error checking cluster health:');
       if (err.response) {
@@ -343,10 +345,13 @@ program
   .option('--verbose', 'Show detailed output')
   .action(async (options) => {
     try {
-      console.log(options.verbose ? 'Making API request to simulate failure...' : '');
+      if (options.verbose) {
+        console.log('Making API request to simulate failure...');
+      }
+
       const response = await axios.post(
         `${API_SERVER_URL}/nodes/${options.node}/simulate-failure`,
-        {}, // empty body
+        {},
         {
           headers: {
             'Content-Type': 'application/json'
@@ -358,47 +363,77 @@ program
         console.log('API Response:', JSON.stringify(response.data, null, 2));
       }
 
-      console.log(`Simulating failure on node ${options.node}...`);
+      console.log(`\nSimulating failure on node ${options.node}...`);
+      console.log('Recovery operations initiated:');
       
-      if (response.data.recoveryOperations) {
+      if (response.data.recoveryOperations && response.data.recoveryOperations.length > 0) {
         response.data.recoveryOperations.forEach(op => {
-          console.log(`Pod ${op.podId} status: ${op.status}`);
-          if (options.verbose && op.toNode) {
-            console.log(`  Rescheduled to node ${op.toNode}`);
+          console.log(`- Pod ${op.podId}: ${op.status}`);
+          if (op.toNode) {
+            console.log(`  ↳ Moving to node ${op.toNode}`);
+          } else if (op.status === 'FAILED') {
+            console.log(`  ↳ No available nodes with sufficient resources`);
           }
         });
+      } else {
+        console.log('- No pods to reschedule');
       }
-      
-      console.log(`System status: ${response.data.systemStatus || 'UNKNOWN'}`);
+
+      console.log('\nSystem status after failure:');
+      const status = response.data.systemStatus || {};
+      console.log(`- Cluster status: ${status.status?.toUpperCase() || 'UNKNOWN'}`);
+      console.log(`- Healthy nodes: ${status.healthyNodes || 0}/${status.totalNodes || 0}`);
+      console.log(`- Pods being recovered: ${status.recoveringNodes || 0}`);
+
+      console.log('\nNext steps:');
+      console.log('1. Run "cluster-cli recovery-status" to monitor progress');
+      console.log('2. Run "cluster-cli list-pods" to verify pod relocation');
+      console.log('3. Run "cluster-cli list-nodes" to check node statuses\n');
 
     } catch (err) {
-      console.error('Error simulating node failure:');
+      console.error('\nError simulating node failure:');
       if (err.response) {
-        console.error(`HTTP Status: ${err.response.status}`);
-        console.error(`Response: ${JSON.stringify(err.response.data, null, 2)}`);
+        console.error(`- HTTP Status: ${err.response.status}`);
+        if (err.response.data) {
+          console.error('- Server response:');
+          console.error(JSON.stringify(err.response.data, null, 2));
+        }
       } else {
-        console.error(err.message);
+        console.error(`- ${err.message}`);
       }
+      console.error('\nTroubleshooting tips:');
+      console.error('1. Verify the node exists: cluster-cli list-nodes');
+      console.error('2. Check API server logs: docker logs <api-container>');
       process.exitCode = 1;
     }
   });
 
-program
+  program
   .command('recovery-status')
   .description('Check status of ongoing recovery operations')
   .action(async () => {
     try {
       const response = await axios.get(`${API_SERVER_URL}/recovery-status`);
       
-      console.log('Recovery Operations:');
-      response.data.operations.forEach((op, index) => {
-        console.log(`${index + 1}. ${op.podId} → node ${op.targetNode} (${op.status.toUpperCase()})`);
-      });
-      
-      if (response.data.estimatedCompletion) {
-        console.log(`Estimated completion: ${response.data.estimatedCompletion}s`);
+      if (!response.data.operations || response.data.operations.length === 0) {
+        console.log('No active recovery operations');
+        return;
       }
-      
+
+      console.log('Active Recovery Operations:');
+      console.log('='.repeat(60));
+      response.data.operations.forEach((op, idx) => {
+        console.log(`${idx + 1}. Pod: ${op.podId}`);
+        console.log(`   Status: ${op.status}`);
+        console.log(`   From Node: ${op.fromNode}`);
+        console.log(`   To Node: ${op.toNode || 'Not yet assigned'}`);
+        console.log(`   Timestamp: ${op.timestamp}`);
+        console.log('-'.repeat(60));
+      });
+
+      if (response.data.estimatedCompletion > 0) {
+        console.log(`\nEstimated time remaining: ${response.data.estimatedCompletion} seconds`);
+      }
     } catch (err) {
       console.error('Error checking recovery status:');
       console.error(err.response?.data?.error || err.message);

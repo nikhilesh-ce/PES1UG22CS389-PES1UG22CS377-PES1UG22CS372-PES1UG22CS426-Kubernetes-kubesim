@@ -296,42 +296,34 @@ app.post('/nodes/:id/simulate-failure', (req, res) => {
     if (!node) {
       return res.status(404).json({ 
         error: 'Node not found',
-        requestId: req.id,
-        availableNodes: [...nodeManager.nodes.keys()] // Show available nodes
+        requestId: req.id
       });
     }
 
-    // Mark node as failed
+    // Ensure lastHeartbeat is properly set
+    node.lastHeartbeat = new Date();
     node.status = 'failed';
-    node.lastHeartbeat = new Date().toISOString();
 
-    // Get pods to reschedule
     const pods = nodeManager.getPodsOnNode(nodeId);
     const recoveryOperations = pods.map(pod => ({
       podId: pod.id,
       status: 'PENDING'
     }));
 
-    // Immediate rescheduling (no timeout)
+    // Immediate rescheduling
     pods.forEach(pod => {
-      const newNodeId = podScheduler.schedulePod(pod.cpuRequired, pod.memoryRequired);
+      const newNodeId = podScheduler.schedulePod(pod.cpuRequired);
       if (newNodeId) {
         nodeManager.movePod(pod.id, nodeId, newNodeId);
-        // Update operation status
-        const op = recoveryOperations.find(o => o.podId === pod.id);
-        if (op) {
-          op.status = 'COMPLETED';
-          op.newNodeId = newNodeId;
-        }
       }
     });
 
     res.json({
       message: 'Node failure simulated',
       nodeId,
-      status: 'failed',
+      status: node.status,
       recoveryOperations,
-      systemStatus: healthMonitor.getSystemStatus(), // Add system status
+      systemStatus: healthMonitor.getSystemStatus(),
       requestId: req.id
     });
 
@@ -346,24 +338,21 @@ app.post('/nodes/:id/simulate-failure', (req, res) => {
   }
 });
 
+    
+
 app.get('/recovery-status', (req, res) => {
   try {
-    const recoveryOperations = [];
-    nodeManager.nodes.forEach(node => {
-      if (node.status === 'failed') {
-        nodeManager.getPodsOnNode(node.nodeId).forEach(pod => {
-          recoveryOperations.push({
-            podId: pod.id,
-            status: pod.nodeId !== node.nodeId ? 'COMPLETED' : 'PENDING',
-            nodeId: pod.nodeId
-          });
-        });
-      }
-    });
-
+    const operations = nodeManager.getRecoveryStatus();
+    
     res.json({
-      operations: recoveryOperations,
-      estimatedCompletion: recoveryOperations.filter(op => op.status === 'PENDING').length * 5,
+      operations: operations.map(op => ({
+        podId: op.podId,
+        fromNode: op.fromNode,
+        toNode: op.toNode,
+        status: op.status,
+        timestamp: op.timestamp.toISOString()
+      })),
+      estimatedCompletion: operations.filter(op => op.status === 'PENDING').length * 5,
       requestId: req.id
     });
   } catch (err) {
@@ -374,7 +363,6 @@ app.get('/recovery-status', (req, res) => {
     });
   }
 });
-
 // Debugging Endpoints
 app.get('/nodes/:id/logs', (req, res) => {
   try {
@@ -623,21 +611,19 @@ app.post('/pods', async (req, res) => {
 
 app.get('/pods', (req, res) => {
   try {
-    const pods = [...nodeManager.pods.entries()].map(([id, pod]) => ({
-      podId: id,
+    const pods = nodeManager.getAllPods().map(pod => ({
+      id: pod.id,  // Ensure ID is included
       nodeId: pod.nodeId,
       cpuRequired: pod.cpuRequired,
-      memoryRequired: pod.memoryRequired || null,
       status: pod.status,
+      uptime: pod.uptime,
       createdAt: pod.createdAt,
-      uptime: Math.floor((new Date() - new Date(pod.createdAt)) / 1000) + 's',
-      nodeStatus: nodeManager.nodes.get(pod.nodeId)?.status,
       links: {
-        node: `/nodes/${pod.nodeId}`,
-        details: `/pods/${id}`,
-        logs: `/pods/${id}/logs`
+        details: `/pods/${pod.id}`,
+        logs: `/pods/${pod.id}/logs`
       }
     }));
+
 
     res.json({
       pods,
